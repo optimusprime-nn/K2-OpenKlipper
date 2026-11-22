@@ -217,6 +217,15 @@ class ToolHead:
         self.buffer_headroom = config.getfloat('buffer_headroom', 0.,
                                                minval=0., maxval=2.)
         self.buffer_time_high = BUFFER_TIME_HIGH + self.buffer_headroom
+        # Extra seconds of steps sent ahead during homing and probing moves
+        # ("drip" mode). Upstream sends them only 0.1 s ahead, and a host
+        # stall longer than that at the start of a probe tap delivers the
+        # first steps late: "Timer too close", then "Stepper too far in
+        # past" (GitHub issue #24, K2 Plus at the START_PRINT tap). Steps
+        # sent past a trigger are dropped by the MCU, so accuracy is
+        # unchanged.
+        self.drip_headroom = config.getfloat('drip_headroom', 0.,
+                                             minval=0., maxval=0.5)
         self.lookahead = LookAheadQueue()
         self.lookahead.set_flush_time(self.buffer_time_high)
         self.commanded_pos = [0., 0., 0., 0.]
@@ -244,6 +253,7 @@ class ToolHead:
         # Setup for generating moves
         self.motion_queuing = self.printer.load_object(config, 'motion_queuing')
         self.motion_queuing.set_buffer_headroom(self.buffer_headroom)
+        self.motion_queuing.set_drip_headroom(self.drip_headroom)
         self.motion_queuing.register_flush_callback(self._handle_step_flush,
                                                     can_add_trapq=True)
         self.trapq = self.motion_queuing.allocate_trapq()

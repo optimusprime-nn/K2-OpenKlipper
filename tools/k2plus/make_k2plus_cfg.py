@@ -148,6 +148,12 @@ retry_tolerance: 0.1
     ("Z speeds: keep the K2 limits for the beta (stock Plus allows 30)",
      "max_z_velocity: 20  # stock K2\n",
      "max_z_velocity: 20  # stock K2 Plus allows 30; K2 limit kept for the beta\n"),
+    ("probe/homing steps sent 0.25 s ahead, not 0.1 s: two START_PRINT taps\n"
+     "ended in 'Timer too close' then 'Stepper too far in past', the first\n"
+     "tap steps reaching the MCU late (GitHub issue #24)",
+     "max_z_accel: 500  # stock K2\n",
+     "max_z_accel: 500  # stock K2\n"
+     "drip_headroom: 0.15  # tap/homing steps 0.25 s ahead, not 0.1 (#24)\n"),
     ("extruder PID: stock K2 Plus (its below-280C set; mainline Klipper has\n"
      "one set, Creality switches to 16.443/1.370/49.329 above 280C).\n"
      "Reviewed against a live K2 Plus by nur00's Claude, 11-02",
