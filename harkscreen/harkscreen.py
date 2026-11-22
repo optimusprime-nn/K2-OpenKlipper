@@ -57,6 +57,7 @@ OBJECTS = {
     "hark_chamber": ["enabled", "requested"],
     "toolhead": ["homed_axes"],
     "gcode_move": ["gcode_position", "homing_origin"],
+    "k2_z_align": ["endstop_triggered"],
     "gcode_macro START_PRINT": ["z_offset"],
     "k2_cfs": ["fitted", "online", "active_slot", "feed_slot", "running_out",
                "runout_next",
@@ -1624,6 +1625,26 @@ class Screen:
             d.arc((cx - r, cy - r, cx + r, cy + r), 135, 135 + 270 * frac,
                   fill=color, width=width)
 
+    @staticmethod
+    def z_known(st):
+        """The Z Klipper reports means something only while Z is homed:
+        after motors off (idle timeout, M84) it keeps the last commanded
+        position while the bed drops to the bottom."""
+        return "z" in (st.get("toolhead", {}).get("homed_axes") or "")
+
+    @classmethod
+    def z_label(cls, st, height=0):
+        """The Z line on the Status card ("Z 12.40 mm of 30.0")."""
+        if not cls.z_known(st):
+            if st.get("k2_z_align", {}).get("endstop_triggered"):
+                return "Z not homed (bed at bottom)"
+            return "Z not homed"
+        z = st.get("gcode_move", {}).get("gcode_position", [0, 0, 0])[2]
+        txt = "Z %.2f mm" % z
+        if height and height > 0:
+            txt += " of %.1f" % height
+        return txt
+
     def busy(self, st):
         """Klipper is executing G-code (homing, cleaning...) outside a print."""
         ps = st.get("print_stats", {}).get("state")
@@ -1722,7 +1743,7 @@ class Screen:
             round(((st.get("heater_fan hotend_fan") or {}).get("rpm") or 0)
                   / 50),
             (st.get("heater_fan hotend_fan") or {}).get("speed"),
-            st.get("hark_fans"), round(z, 2), rem,
+            st.get("hark_fans"), round(z, 2), rem, st.get("k2_z_align"),
             st.get("k2_cfs"), st.get("hark_cfs_slots"),
             st.get("filament_switch_sensor filament_sensor"),
             st.get("k2_motor_bus"), st.get("output_pin chamber_led"),
@@ -2347,7 +2368,8 @@ class Screen:
             if thumb and thumb[1] is not None:
                 # The model, filled in up to the printed height
                 frac = 1. if state == "complete" else (
-                    z / thumb[2] if thumb[2] > 0 else prog)
+                    z / thumb[2] if thumb[2] > 0 and self.z_known(st)
+                    else prog)
                 pbox = (lx, ly + 42, lx + 172, ly + 214)
                 self.draw_preview(d, pbox, thumb, max(0., min(1., frac)),
                                   state == "printing")
@@ -2401,9 +2423,7 @@ class Screen:
                             "Other file", ("files_open",), "muted", True,
                             "s")
             else:
-                ztxt = "Z %.2f mm" % z
-                if thumb and thumb[2] > 0:
-                    ztxt += " of %.1f" % thumb[2]
+                ztxt = self.z_label(st, thumb[2] if thumb else 0)
                 self.text(d, (lx, left[3] - 30), ztxt, "s", "muted",
                           anchor="lm")
         else:
