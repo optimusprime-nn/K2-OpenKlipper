@@ -119,7 +119,12 @@ Empty bed. Then:
 
 `G28` lowers the bed 5 mm (both Z motors), homes X and Y, then taps the
 nozzle on the bed centre. `Z_TILT_ADJUST` taps at the left and right and
-levels the two Z motors; send its output.
+levels the two Z motors; send its output. Outside a print, `G28 Z` first
+takes Z from the bottom switches, which levels the motors back to the
+switches, and then puts the `Z_TILT_ADJUST` correction back (the console
+says `Z tilt kept from before the bottom reference`), so probing after it
+measures the levelled bed. Switching the motors off (or a restart) forgets
+the tilt: run `Z_TILT_ADJUST` or `Z_TILT_APPLY_SAVED` again.
 
 Now check the bottom switches:
 

@@ -160,13 +160,30 @@ class ZTilt:
         self.run_total = [0.] * len(self.z_positions)
         self.retry_helper.start(gcmd)
         self.probe_helper.start_probe(gcmd)
+    def _from_switches(self):
+        # K2 OpenKlipper: each Z motor's height relative to the bottom
+        # switches (k2_z_align), in z_steppers order, or None when that is
+        # not known. Only the differences between the motors matter.
+        z_align = self.printer.lookup_object('k2_z_align', None)
+        offsets = getattr(z_align, 'tilt_offsets', None)
+        tilt = offsets() if offsets is not None else None
+        if not tilt:
+            return None
+        try:
+            return [tilt[s.get_name()] for s in self.z_helper.z_steppers]
+        except KeyError:
+            return None
     def _save_run(self):
         import json, os
+        # Saved relative to the bottom switches when they are the reference
+        # (a G28 Z keeps the tilt since issue #7, so a later run only
+        # corrects what is left: its own total alone would be too small)
+        adjustments = self._from_switches() or self.run_total
         try:
             tmp = self.saved_path + '.tmp'
             with open(tmp, 'w') as f:
                 json.dump({'adjustments': [round(a, 5)
-                                           for a in self.run_total]}, f)
+                                           for a in adjustments]}, f)
             os.replace(tmp, self.saved_path)
         except OSError:
             logging.exception("z_tilt: could not save %s", self.saved_path)
@@ -190,6 +207,12 @@ class ZTilt:
         if max(abs(a) for a in adj) > limit:
             raise gcmd.error("Saved Z tilt %s is over %.2f mm: run "
                              "Z_TILT_ADJUST instead" % (adj, limit))
+        # Relative to the bottom switches: only move what is missing, so a
+        # tilt still in place (kept by G28 Z, or a warm start) is not
+        # applied twice
+        now = self._from_switches()
+        if now is not None:
+            adj = [a - n for a, n in zip(adj, now)]
         self.z_helper.adjust_steppers(adj, self.probe_helper.get_lift_speed())
         self.z_status.reset()
         gcmd.respond_info("Z tilt from the last Z_TILT_ADJUST applied: %s"
