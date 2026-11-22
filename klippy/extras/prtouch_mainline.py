@@ -17,8 +17,10 @@ from .prtouch_open import tap_select
 _NO_TRIGGER_ERROR = "No trigger on probe after full movement"
 _NO_TRIGGER_HINT = (
     "PRTouch: the nozzle used its full travel without feeling the bed. If it"
-    " stopped short of the bed, run KZ_ALIGN_MEASURE CONFIRM=1 and set the"
-    " suggested position_endstop in printer-overrides.cfg. If it reached the"
+    " stopped short of the bed, the bottom switch height (position_endstop)"
+    " is too low for this printer (KZ_ALIGN_STATUS shows it; after a nozzle"
+    " change, KZ_ALIGN_FORGET CONFIRM=1 drops a saved one); once a tap"
+    " works, store it with KZ_ALIGN_MEASURE CONFIRM=1 SAVE=1. If it reached the"
     " bed, clean the nozzle tip while it is hot.")
 # Z moves to and from the scrub start height, like the macros' G1 Z5 F600.
 _SCRUB_CLEAR_Z_SPEED = 10.
@@ -414,6 +416,25 @@ class PRTouchMainlineProbe:
     def start_probe_session(self, gcmd):
         return self.probe_session.start_probe_session(gcmd)
 
+    def home_floor_z(self, z_align, gcmd):
+        """The lowest Z a Z-home tap may search to: probe_minimum_z, or
+        lower while [k2_z_align] says Z comes from the bottom switches with
+        a position_endstop not measured yet (#21). A low guess is the safe
+        side, so the bed may really be further away than Z says; the
+        search stays armed on the strain gauge the whole way."""
+        floor_z = self.probe_minimum_z
+        tap_min_z = getattr(z_align, "tap_min_z", None)
+        if tap_min_z is None:
+            return floor_z
+        extended = tap_min_z()
+        if extended is not None and extended < floor_z:
+            floor_z = max(extended, probe_helpers.lookup_minimum_z(
+                self.config))
+            gcmd.respond_info(
+                "PRTouch: bottom switch height not measured yet; this tap "
+                "may search down to Z=%.2f" % (floor_z,))
+        return floor_z
+
     def cmd_PRTOUCH_HOME_Z(self, gcmd):
         """Run bounded K2-specific taps and define median contact as Z zero."""
         toolhead = self.printer.lookup_object("toolhead")
@@ -439,6 +460,8 @@ class PRTouchMainlineProbe:
         )
         # A failed or partial home must not leave an old plane advertised.
         self.contact_plane_frame = None
+        z_align = self.printer.lookup_object("k2_z_align", None)
+        floor_z = self.home_floor_z(z_align, gcmd)
 
         def tap(trigger_zs):
             # Every tap starts from the same temporary absolute coordinate.
@@ -456,7 +479,7 @@ class PRTouchMainlineProbe:
                 if trigger_zs:
                     reference_z = statistics.median(trigger_zs)
                     target_z = reference_z - self.home_followup_guard
-                target_z = max(target_z, self.probe_minimum_z)
+                target_z = max(target_z, floor_z)
                 movepos = toolhead.get_position()
                 movepos[2] = target_z
                 trigger_z = self.probing_move(movepos, speed, start_z, gcmd)
@@ -525,6 +548,9 @@ class PRTouchMainlineProbe:
         if len(best) != len(trigger_zs):
             msg += " (best %d of %d taps)" % (len(best), len(trigger_zs))
         gcmd.respond_info(msg)
+        note_home_tap = getattr(z_align, "note_home_tap", None)
+        if note_home_tap is not None:
+            note_home_tap(median_z, gcmd)
 
 
     # ---- PRTOUCH_SCRUB ---------------------------------------------------

@@ -32,10 +32,13 @@ The config is generated from the K2 one by `tools/k2plus/make_k2plus_cfg.py`
 
 ## Known gaps
 
-- **Bottom switch height** is `position_endstop: 349.5`: the tested K2 Plus
-  measured 349.85 / 350.10 and Creality's config puts the bottom at 350, less
-  a little (too low is safe: the bed stops short and the nozzle tap fails
-  instead of touching). Step 6 checks it on your printer.
+- **Bottom switch height** is `position_endstop: 349.5` until you measure
+  your printer: K2 Plus printers measured 349.85, 350.10 and 352.60 (that
+  one with a 0.6 nozzle), and Creality's config puts the bottom at 350. Too
+  low is the safe side (the bed stops short of the nozzle), so the default
+  stays low, and until a measured value is saved the first nozzle tap after
+  the switches searches up to 4 mm below Z=0 instead of 0.6 mm, which covers
+  bottoms up to 353.5. Step 6 measures and saves your printer's value.
 - **Rear cleaning strip scrub is on, and has not been run on a K2 Plus.**
   The positions and depth come from Creality's code and a K2. Step 7 checks
   the positions before your first print, and please report what it does.
@@ -123,19 +126,30 @@ levels the two Z motors; send its output.
 
 Now check the bottom switches:
 
-    KZ_ALIGN_MEASURE CONFIRM=1
+    KZ_ALIGN_MEASURE CONFIRM=1 SAVE=1
 
 The bed goes down slowly until each switch triggers and the console prints
-where, with a suggested `position_endstop`. Send the output. If the
-suggestion is not 349.5, put it in **printer-overrides.cfg** (Mainsail >
-Machine), save and restart:
+where, with a suggested `position_endstop`. With `SAVE=1` it keeps the
+lowest switch less 0.1 mm in `k2_z_align.json` (next to printer.cfg) and
+uses it from then on, also after a restart: nothing to edit by hand. Send
+the output. `KZ_ALIGN_STATUS` shows the value in use and where it came from
+(`config` or `saved`).
 
-    [k2_z_align]
-    position_endstop: 351.20
+A saved value replaces any `position_endstop` you set in
+printer-overrides.cfg earlier; you can delete that line. It is refused if
+it is more than 5 mm from the config value (check the nozzle and bed, and
+set it by hand if it really is right).
 
-A small difference can matter. On one K2 Plus, 350.10 instead of 349.5 was
-enough for the nozzle tap to fail with `No trigger on probe after full
-movement`, and setting the measured value fixed it.
+Measure again after changing the nozzle: nozzle length moves the bottom.
+If the tap fails with `No trigger on probe after full movement` after a
+nozzle change, `KZ_ALIGN_FORGET CONFIRM=1` goes back to the low default
+(with the wider first tap), then home and measure again.
+
+Before a value is saved, the first tap after the switches may search 4 mm
+below Z=0 and the console says so; after the tap it also says where it puts
+the switches. That is what `G28` used to fail on (`No trigger on probe after
+full movement`, issue #21): the old search stopped 0.6 mm below Z=0, and one
+K2 Plus has its bottom 3.1 mm above the default.
 
 Then check the full homing sequence that every print starts with:
 
