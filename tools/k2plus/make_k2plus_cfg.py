@@ -285,6 +285,19 @@ cutter_y: 150
 """, """cutter_x: 10
 cutter_y: 200
 """),
+    ("PA_CAL_RUN wiggle over the Plus chute (issue #23). The K2 range\n"
+     "X113-127 is the K2 chute (purge_x 115 to gate 127) and on the Plus it\n"
+     "runs 20 mm left of purge_x 133 into the chute wall. Use X133-139 at\n"
+     "purge_y instead: the stretch every CFS_PURGE_POSITION already travels\n"
+     "(entry 139 -> gate 135 -> purge 133). The speed drops so each segment\n"
+     "still lasts about 0.35 s, as on the K2 (14 mm at 40 mm/s)",
+     """    {% set v = params.SPEED|default(40)|float %}
+    {% set xa = params.XA|default(113)|float %}
+    {% set xb = params.XB|default(127)|float %}
+""", """    {% set v = params.SPEED|default(17)|float %}
+    {% set xa = params.XA|default(133)|float %}
+    {% set xb = params.XB|default(139)|float %}
+"""),
     ("stall retry moves inside the bigger frame",
      "manage_runout_sensor: true\n",
      "manage_runout_sensor: true\nstall_retry_moves: Y340, X300, Y40, X40\n"),
