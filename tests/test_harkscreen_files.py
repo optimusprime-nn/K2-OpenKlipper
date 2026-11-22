@@ -489,6 +489,41 @@ class ScreenTest(Base):
         self.render(status(), "1-status-idle")
         self.assertIn(("files_open",), self.actions())
 
+    def drawn_text(self, st):
+        seen, text = [], self.s.text
+
+        def spy(d, xy, msg, *args, **kw):
+            seen.append(msg)
+            return text(d, xy, msg, *args, **kw)
+        self.s.text = spy
+        try:
+            self.render(st, "x")
+        finally:
+            del self.s.text
+        return seen
+
+    def test_status_z_only_while_homed(self):
+        # Issue #20: after idle motors-off Klipper keeps the last commanded
+        # Z (179.86) while the bed drops to the bottom; homed_axes is empty
+        st = status("printing", "Benchy_PLA_0.2mm.gcode")
+        st["gcode_move"] = {"gcode_position": [0, 0, 179.86, 0]}
+        st["toolhead"] = {"homed_axes": ""}
+        seen = self.drawn_text(st)
+        self.assertFalse([t for t in seen if "179.86" in t], seen)
+        self.assertIn("Z not homed", seen)
+        st["k2_z_align"] = {"endstop_triggered": True}
+        self.assertIn("Z not homed (bed at bottom)", self.drawn_text(st))
+        st["toolhead"] = {"homed_axes": "xyz"}
+        self.assertIn("Z 179.86 mm", self.drawn_text(st))
+
+    def test_z_label(self):
+        st = {"toolhead": {"homed_axes": "xy"},
+              "gcode_move": {"gcode_position": [0, 0, 179.86, 0]}}
+        self.assertEqual(hs.Screen.z_label(st, 8.8), "Z not homed")
+        st["toolhead"]["homed_axes"] = "xyz"
+        self.assertEqual(hs.Screen.z_label(st, 8.8), "Z 179.86 mm of 8.8")
+        self.assertEqual(hs.Screen.z_label(st), "Z 179.86 mm")
+
     def test_no_button_while_printing_or_busy(self):
         self.render(status("printing", "Benchy_PLA_0.2mm.gcode"), "x")
         self.assertFalse([a for a in self.actions()
