@@ -16,10 +16,11 @@
 # Combo (F021) or the K2 Plus (F008; docs/K2-PLUS-BETA.md is its first-run
 # guide), at your own risk, OKL_EXTRUDER=stock|dxc2 to answer the
 # extruder question in advance, OKL_CFS=yes|no to fix whether a CFS is used
-# (default: found automatically at each start).
+# (default: found automatically at each start), OKL_REPO=<owner/repo> to
+# install from a fork (default grant0013/K2-OpenKlipper).
 set -eu
 
-REPO=grant0013/K2-OpenKlipper
+REPO=${OKL_REPO:-grant0013/K2-OpenKlipper}
 REF=${OKL_REF:-}
 BUILD=/mnt/UDISK/k2-mainline-20260729-v62
 PDATA=/mnt/UDISK/printer_data_mainline
