@@ -13,6 +13,14 @@ endstop_pin_z: PA15, PA8). endstop_pin takes a list: switch N belongs to
 stepper_z (N=0) or stepper_zN, and the MCU drives each motor to its own
 switch, so the bed also comes back level. KZ_ALIGN_MEASURE finds the Z of
 the switches on a printer whose position_endstop is not known yet.
+
+Levelling back to the switches also throws away a Z_TILT_ADJUST made since
+(issue #7: G28 Z outside a print undid it). KZ_ALIGN_BOTTOM KEEP_TILT=1,
+used by homing_override, notes how far each Z motor has moved relative to
+stepper_z since the last bottom reference (the step counts noted there) and
+puts that difference back once the switches are reached. tilt_offsets()
+gives the same numbers to z_tilt, so a saved tilt is relative to the
+switches. The note is dropped when a Z motor is switched off.
 """
 
 import logging
@@ -49,6 +57,10 @@ class K2ZAlign:
         self.zd_up = config.getint("zd_up", 1, minval=0, maxval=1)
         self.zes_untrig = config.getint(
             "zes_untrig", 1, minval=0, maxval=1)
+        # KEEP_TILT=1 puts back at most this much difference between the
+        # Z motors (more means something moved them apart: re-level)
+        self.keep_tilt_max = config.getfloat(
+            "keep_tilt_max", 2.0, above=0.0)
 
         # (stepper name, step pin, dir pin, switch pin) per Z motor
         self.z_motors = []
@@ -103,9 +115,78 @@ class K2ZAlign:
             "KZ_ALIGN_MEASURE", self.cmd_KZ_ALIGN_MEASURE,
             desc="Find the Z where the bottom switches trigger (Z homed)")
         self.printer.register_event_handler(
+            "klippy:connect", self._handle_connect)
+        self.printer.register_event_handler(
+            "stepper_enable:motor_off", self._forget_bottom)
+        self.printer.register_event_handler(
             "klippy:shutdown", self._handle_shutdown)
         self.printer.register_event_handler(
             "klippy:disconnect", self._handle_shutdown)
+
+    def _handle_connect(self):
+        # A Z motor switched off can slip: the step counts noted at the
+        # switches no longer say where it is
+        stepper_enable = self.printer.lookup_object("stepper_enable", None)
+        if stepper_enable is None:
+            return
+        for name, step_pin, dir_pin, pin in self.z_motors:
+            try:
+                tracking = stepper_enable.lookup_enable(name)
+            except Exception:
+                continue
+            tracking.register_state_callback(self._handle_motor_state)
+
+    def _handle_motor_state(self, print_time, is_enabled):
+        if not is_enabled:
+            self._forget_bottom()
+
+    def _forget_bottom(self):
+        self.bottom_mcu = None
+
+    def tilt_offsets(self):
+        """How far each Z motor has moved relative to stepper_z (mm, by
+        stepper name) since the bottom switches last set them level, or
+        None when that is not known (no bottom reference since the motors
+        were last on, or a single Z motor)."""
+        if not self.bottom_mcu or len(self.z_motors) < 2:
+            return None
+        toolhead = self.printer.lookup_object("toolhead")
+        moved = {}
+        for s in toolhead.get_kinematics().rails[2].get_steppers():
+            start = self.bottom_mcu.get(s.get_name())
+            if start is None:
+                return None
+            moved[s.get_name()] = ((s.get_mcu_position() - start)
+                                   * s.get_step_dist())
+        ref = moved.get("stepper_z")
+        if ref is None or len(moved) < 2:
+            return None
+        return dict((name, m - ref) for name, m in moved.items())
+
+    def _restore_tilt(self, gcmd, tilt):
+        """Put back the Z motor difference noted before the move."""
+        worst = max(abs(t) for t in tilt.values())
+        if worst < 0.001:
+            return
+        if worst > self.keep_tilt_max:
+            gcmd.respond_info(
+                "Z tilt not kept: the Z motors were %.3f mm apart (over "
+                "keep_tilt_max %.2f). Run Z_TILT_ADJUST." % (
+                    worst, self.keep_tilt_max))
+            return
+        z_tilt = self.printer.lookup_object("z_tilt", None)
+        helper = getattr(z_tilt, "z_helper", None)
+        if helper is None or not helper.z_steppers:
+            return
+        try:
+            adjust = [tilt[s.get_name()] for s in helper.z_steppers]
+        except KeyError:
+            return
+        helper.adjust_steppers(adjust, self.retract_speed)
+        gcmd.respond_info(
+            "Z tilt kept from before the bottom reference: %s" % (
+                ", ".join("%s %+.4f" % (s.get_name(), a) for s, a
+                          in zip(helper.z_steppers, adjust)),))
 
     @staticmethod
     def _plain_pin(pin):
@@ -318,6 +399,14 @@ class K2ZAlign:
                            print_duration))
 
         toolhead.wait_moves()
+        # KEEP_TILT=1: note the Z motor difference (a Z_TILT_ADJUST since
+        # the last bottom reference) while Z is still known
+        tilt = None
+        if gcmd.get_int("KEEP_TILT", 0, minval=0, maxval=1):
+            homed = toolhead.get_status(self.reactor.monotonic()).get(
+                "homed_axes", "")
+            if "z" in homed:
+                tilt = self.tilt_offsets()
         # The MCU routine drives the Z step pin directly, outside Klipper's
         # trap queue. From this point until a successful optical reference,
         # the previous logical Z coordinate must not be trusted.
@@ -365,6 +454,8 @@ class K2ZAlign:
                 target[2] -= self.retract_dist
                 toolhead.manual_move(target, self.retract_speed)
                 toolhead.wait_moves()
+            if tilt:
+                self._restore_tilt(gcmd, tilt)
             elapsed = self.reactor.monotonic() - started
             gcmd.respond_info(
                 "K2 Z bottom reference complete in %.3fs: "

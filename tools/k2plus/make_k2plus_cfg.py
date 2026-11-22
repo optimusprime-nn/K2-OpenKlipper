@@ -467,6 +467,8 @@ scrub_y_max: 356.5
     # earlier tap that fired early, or a 350 mm climb with the gauge armed,
     # could otherwise leave Z wrong by the whole bed travel (10-31). A print
     # already parks on the switches in START_PRINT and keeps that Z.
+    # KEEP_TILT=1: a Z_TILT_ADJUST made since the last bottom reference is
+    # put back after the switches, so G28 Z does not undo it (issue #7).
     {% set z_from_bottom = home_z and printer.print_stats.state not in ("printing", "paused") %}
 """),
     ("G28 outside a print: park on the bottom switches before XY homing",
@@ -475,7 +477,7 @@ scrub_y_max: 356.5
             FORCE_MOVE STEPPER=stepper_z DISTANCE=5 VELOCITY=10
 """, """    {% if home_z %}
         {% if z_from_bottom %}
-            KZ_ALIGN_BOTTOM CONFIRM=1
+            KZ_ALIGN_BOTTOM CONFIRM=1 KEEP_TILT=1
         {% elif not z_was_homed %}
             FORCE_MOVE STEPPER=stepper_z DISTANCE=5 VELOCITY=10
 """),

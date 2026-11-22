@@ -100,6 +100,15 @@
 #   MOTOR_BUS_SEND ADDR=<int> PAYLOAD=<hex> [CHECK=1] - raw frame (len+crc
 #                                     added); CHECK=1 waits for a valid reply
 #   MOTOR_INIT                      - run the wake-up again
+#   MOTOR_WAIT_READY [TIMEOUT=60] [WAKE=1]
+#                                   - wait for the start-up wake that runs
+#                                     after "ready" (about 10 s); if it
+#                                     ended with a motor missing, run the
+#                                     wake once more (WAKE=0: don't); error
+#                                     if the motors are still not ready.
+#                                     homing_override runs it, so a G28
+#                                     right after FIRMWARE_RESTART waits
+#                                     instead of failing (issue #7)
 #   MOTOR_FAULTS                    - read and decode X/Y/E protection
 #   MOTOR_CLEAR_FAULTS [BLOCK=1]    - read, clear, read again; BLOCK=1 raises
 #                                     an error if an error is still latched
@@ -171,6 +180,10 @@ class K2MotorBus:
         self.extruder_addr = self.extruder_addrs[0]
         self.motors = {}
         self.motors_ready = not self.init_motors
+        # 'pending' until the start-up wake (klippy:ready) begins,
+        # 'running' during any wake, 'done' after it. Klipper reports ready
+        # about 10 s before the wake ends (issue #7).
+        self.wake_state = 'pending' if self.init_motors else 'done'
         self.cfs_addr = config.getint('cfs_addr', 1, minval=1, maxval=127)
         uniid = config.get('cfs_uniid', '').replace(' ', '')
         self.cfs_uniid = bytes.fromhex(uniid) if uniid else None
@@ -247,6 +260,9 @@ class K2MotorBus:
                                desc="Send raw frame on the motor RS485 bus")
         gcode.register_command('MOTOR_INIT', self.cmd_MOTOR_INIT,
                                desc="Wake the closed-loop motors")
+        gcode.register_command('MOTOR_WAIT_READY', self.cmd_MOTOR_WAIT_READY,
+                               desc="Wait for the motor wake-up after a "
+                                    "restart (homing runs it)")
         gcode.register_command('MOTOR_FAULTS', self.cmd_MOTOR_FAULTS,
                                desc="Read and decode X/Y/E motor protection")
         gcode.register_command('MOTOR_CLEAR_FAULTS',
@@ -608,12 +624,18 @@ class K2MotorBus:
     def wake_motors(self):
         """Replay stock motor_control's start-up handshake. After a power
         cycle one driver can miss the first pass, so repeat it a few times."""
-        for attempt in range(1, WAKE_ATTEMPTS + 1):
-            if self._wake_once():
-                break
-            logging.warning("k2_motor_bus: wake pass %d of %d incomplete: %s",
-                            attempt, WAKE_ATTEMPTS, self.motors)
-        self.motors_ready = bool(self.motors) and all(self.motors.values())
+        self.wake_state = 'running'
+        try:
+            for attempt in range(1, WAKE_ATTEMPTS + 1):
+                if self._wake_once():
+                    break
+                logging.warning("k2_motor_bus: wake pass %d of %d "
+                                "incomplete: %s", attempt, WAKE_ATTEMPTS,
+                                self.motors)
+            self.motors_ready = (bool(self.motors)
+                                 and all(self.motors.values()))
+        finally:
+            self.wake_state = 'done'
         logging.info("k2_motor_bus: motors %s, ready=%s", self.motors,
                      self.motors_ready)
         for msg in self.calibration_warnings:
@@ -1085,6 +1107,39 @@ class K2MotorBus:
         else:
             msg = "0x%02x (as expected)" % (addr,)
         gcmd.respond_info("Extruder motor controller address: %s" % (msg,))
+
+    def wait_wake(self, timeout):
+        """Pause (this greenlet only) until no wake is pending or running,
+        at most timeout seconds. Returns True if the wake has ended."""
+        end = self.reactor.monotonic() + timeout
+        while self.wake_state != 'done':
+            now = self.reactor.monotonic()
+            if now >= end:
+                return False
+            self.reactor.pause(min(now + 0.25, end))
+        return True
+
+    def cmd_MOTOR_WAIT_READY(self, gcmd):
+        timeout = gcmd.get_float('TIMEOUT', 60., minval=0.)
+        wake = gcmd.get_int('WAKE', 1, minval=0, maxval=1)
+        if self.motors_ready:
+            return
+        if self.wake_state != 'done':
+            gcmd.respond_info("Waiting for the motors to wake up after the "
+                              "restart...")
+            if not self.wait_wake(timeout):
+                raise gcmd.error(
+                    "The motors are still waking up after %.0f s (see "
+                    "k2_motor_bus in klippy.log). Try again shortly, run "
+                    "MOTOR_INIT, or restart the printer." % (timeout,))
+        if not self.motors_ready and wake:
+            gcmd.respond_info("Motors not ready (%s): running the wake-up "
+                              "again" % (self.motors,))
+            self.wake_motors()
+        if not self.motors_ready:
+            raise gcmd.error(
+                "The X/Y/E motors did not wake up (see k2_motor_bus in "
+                "klippy.log). Run MOTOR_INIT, or restart the printer.")
 
     def cmd_MOTOR_INIT(self, gcmd):
         ok = self.wake_motors()
