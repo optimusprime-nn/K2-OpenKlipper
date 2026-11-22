@@ -12,7 +12,13 @@ The K2 Plus has two Z motors, each with its own switch (stock z_align:
 endstop_pin_z: PA15, PA8). endstop_pin takes a list: switch N belongs to
 stepper_z (N=0) or stepper_zN, and the MCU drives each motor to its own
 switch, so the bed also comes back level. KZ_ALIGN_MEASURE finds the Z of
-the switches on a printer whose position_endstop is not known yet.
+the switches on a printer whose position_endstop is not known yet, and
+with SAVE=1 keeps the result in k2_z_align.json next to printer.cfg, used
+from then on instead of the config value (KZ_ALIGN_FORGET drops it).
+
+Until a measured value is saved, unmeasured_tap_travel lets the first
+nozzle tap after a bottom reference search that much below Z=0, so a
+position_endstop guessed low (the safe side) still finds the bed (#21).
 
 Levelling back to the switches also throws away a Z_TILT_ADJUST made since
 (issue #7: G28 Z outside a print undid it). KZ_ALIGN_BOTTOM KEEP_TILT=1,
@@ -23,7 +29,9 @@ gives the same numbers to z_tilt, so a saved tilt is relative to the
 switches. The note is dropped when a Z motor is switched off.
 """
 
+import json
 import logging
+import os
 
 import mcu
 
@@ -46,8 +54,35 @@ class K2ZAlign:
         self.filter_count = config.getint(
             "filter_count", 10, minval=1, maxval=255)
         self.timeout = config.getfloat("timeout", 60.0, above=0.0)
-        self.position_endstop = config.getfloat(
+        self.config_position_endstop = config.getfloat(
             "position_endstop", 263.12734375)
+        self.position_endstop = self.config_position_endstop
+        self.endstop_source = "config"
+        # KZ_ALIGN_MEASURE SAVE=1 stores min(measured) - save_margin, never
+        # more than max_saved_change from the config value
+        self.save_margin = config.getfloat(
+            "save_margin", 0.1, minval=0.0, maxval=1.0)
+        self.max_saved_change = config.getfloat(
+            "max_saved_change", 5.0, above=0.0, maxval=20.0)
+        # How far below Z=0 the first tap after a bottom reference may
+        # search while position_endstop has not been measured (0 = only
+        # [prtouch_mainline] probe_minimum_z, as on the K2)
+        self.unmeasured_tap_travel = config.getfloat(
+            "unmeasured_tap_travel", 0.0, minval=0.0, maxval=5.0)
+        try:
+            config_file = self.printer.get_start_args().get(
+                "config_file", "")
+        except AttributeError:
+            config_file = ""
+        self.state_path = config.get(
+            "state_path",
+            os.path.join(os.path.dirname(config_file)
+                         or "/mnt/UDISK/printer_data_mainline/config",
+                         "k2_z_align.json"))
+        self.saved_note = None
+        # True from a bottom reference until a nozzle tap (or other Z
+        # homing) replaces that Z frame
+        self.frame_from_bottom = False
         self.bottom_mcu = None
         self.retract_dist = config.getfloat(
             "retract_dist", 10.0, minval=0.0)
@@ -79,6 +114,7 @@ class K2ZAlign:
         self.rotation_distance = stepper.getfloat("rotation_distance")
         self.microsteps = stepper.getint("microsteps")
         self.position_max = stepper.getfloat("position_max")
+        self._load_saved()
 
         self.oid = self.mcu.create_oid()
         self.query_cmd = None
@@ -114,14 +150,102 @@ class K2ZAlign:
         self.gcode.register_command(
             "KZ_ALIGN_MEASURE", self.cmd_KZ_ALIGN_MEASURE,
             desc="Find the Z where the bottom switches trigger (Z homed)")
+        self.gcode.register_command(
+            "KZ_ALIGN_FORGET", self.cmd_KZ_ALIGN_FORGET,
+            desc="Drop the saved bottom switch height (use the config)")
         self.printer.register_event_handler(
             "klippy:connect", self._handle_connect)
+        # One motor-off handler: the Z frame (#21) and the tilt note (#7)
+        # are both lost when the motors switch off
         self.printer.register_event_handler(
-            "stepper_enable:motor_off", self._forget_bottom)
+            "stepper_enable:motor_off", self._handle_motor_off)
         self.printer.register_event_handler(
             "klippy:shutdown", self._handle_shutdown)
         self.printer.register_event_handler(
             "klippy:disconnect", self._handle_shutdown)
+        self.printer.register_event_handler(
+            "homing:home_rails_end", self._handle_home_rails_end)
+
+    # --- saved position_endstop -----------------------------------------
+
+    def _load_saved(self):
+        try:
+            with open(self.state_path) as f:
+                data = json.load(f)
+            value = float(data["position_endstop"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if not self._saved_value_ok(value):
+            self.saved_note = (
+                "saved %.2f in %s ignored: more than %.1f mm from the config"
+                " value %.2f, or above position_max"
+                % (value, self.state_path, self.max_saved_change,
+                   self.config_position_endstop))
+            logging.warning("k2_z_align: %s", self.saved_note)
+            return
+        self.position_endstop = value
+        self.endstop_source = "saved"
+
+    def _saved_value_ok(self, value):
+        return (0. < value <= self.position_max
+                and abs(value - self.config_position_endstop)
+                <= self.max_saved_change)
+
+    def _write_saved(self, value, found):
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"position_endstop": round(value, 3),
+                       "measured": dict(
+                           (self.endstop_pins[i], round(z, 3))
+                           for i, z in sorted(found.items())),
+                       "save_margin": self.save_margin}, f, indent=1)
+        os.replace(tmp, self.state_path)
+
+    def endstop_measured(self):
+        return self.endstop_source == "saved"
+
+    # --- the first nozzle tap after a bottom reference --------------------
+
+    def _handle_frame_lost(self, *args):
+        self.frame_from_bottom = False
+
+    def _handle_motor_off(self, *args):
+        self._handle_frame_lost()
+        self._forget_bottom()
+
+    def _handle_home_rails_end(self, homing_state, rails):
+        for rail in rails:
+            if any(s.get_name().startswith("stepper_z")
+                   for s in rail.get_steppers()):
+                self.frame_from_bottom = False
+
+    def tap_min_z(self):
+        """The lowest Z the next nozzle-tap home may search to, or None for
+        the probe's own probe_minimum_z. Lower only while Z comes from a
+        bottom reference with an unmeasured position_endstop: a guess on
+        the safe (low) side puts the bed further from the nozzle than Z
+        says, by up to unmeasured_tap_travel."""
+        if (self.frame_from_bottom and not self.endstop_measured()
+                and self.unmeasured_tap_travel > 0.):
+            return -self.unmeasured_tap_travel
+        return None
+
+    def note_home_tap(self, contact_z, gcmd):
+        """A nozzle tap made contact_z (in the frame before it) Z=0. If that
+        frame came from the bottom switches, say where the tap puts them,
+        so a wrong position_endstop shows up."""
+        if not self.frame_from_bottom:
+            return
+        self.frame_from_bottom = False
+        if self.endstop_measured() and abs(contact_z) < 0.25:
+            return
+        gcmd.respond_info(
+            "K2 Z bottom: this tap puts the bottom switches near Z=%.2f"
+            " (position_endstop in use %.2f, from the %s). To store a"
+            " measured value: G28, Z_TILT_ADJUST, G28 Z, then"
+            " KZ_ALIGN_MEASURE CONFIRM=1 SAVE=1"
+            % (self.position_endstop - contact_z, self.position_endstop,
+               self.endstop_source))
 
     def _handle_connect(self):
         # A Z motor switched off can slip: the step counts noted at the
@@ -250,6 +374,8 @@ class K2ZAlign:
         return {
             "active": self.active,
             "endstop_triggered": self.switch_triggered,
+            "position_endstop": self.position_endstop,
+            "endstop_source": self.endstop_source,
             "switches": list(self.switches),
             "last_flag": self.last_flag,
             "last_delta": self.last_delta,
@@ -262,10 +388,38 @@ class K2ZAlign:
             for pin, s in zip(self.endstop_pins, self.switches))
 
     def cmd_KZ_ALIGN_STATUS(self, gcmd):
+        msg = ("K2 Z bottom switch: %s; active=%s; last_flag=%s; "
+               "last_delta=%s; position_endstop %.2f (%s)"
+               % (self._describe_switches(), self.active, self.last_flag,
+                  self.last_delta, self.position_endstop,
+                  self.endstop_source))
+        if self.saved_note:
+            msg += "; " + self.saved_note
+        gcmd.respond_info(msg)
+
+    def cmd_KZ_ALIGN_FORGET(self, gcmd):
+        if gcmd.get_int("CONFIRM", 0, minval=0, maxval=1) != 1:
+            raise gcmd.error("KZ_ALIGN_FORGET requires CONFIRM=1")
+        if self.active:
+            raise gcmd.error("K2 Z bottom-reference motion is active")
+        try:
+            os.remove(self.state_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise gcmd.error("Could not remove %s: %s"
+                             % (self.state_path, e))
+        self.position_endstop = self.config_position_endstop
+        self.endstop_source = "config"
+        self.saved_note = None
+        # A Z set from the bottom switches used the old value
+        if self.frame_from_bottom:
+            self.printer.lookup_object("toolhead").get_kinematics(
+                ).clear_homing_state("z")
+            self.frame_from_bottom = False
         gcmd.respond_info(
-            "K2 Z bottom switch: %s; active=%s; last_flag=%s; last_delta=%s"
-            % (self._describe_switches(), self.active, self.last_flag,
-               self.last_delta))
+            "Saved bottom switch height dropped; position_endstop %.2f from"
+            " the config" % (self.position_endstop,))
 
     def _step_until(self, toolhead, z, z_end, step, speed, want):
         """Move Z down (bed away from the nozzle) in steps from z to z_end
@@ -287,6 +441,7 @@ class K2ZAlign:
         position_max. The result is what position_endstop should be."""
         if gcmd.get_int("CONFIRM", 0, minval=0, maxval=1) != 1:
             raise gcmd.error("KZ_ALIGN_MEASURE requires CONFIRM=1")
+        save = gcmd.get_int("SAVE", 0, minval=0, maxval=1) == 1
         toolhead = self.printer.lookup_object("toolhead")
         eventtime = self.reactor.monotonic()
         if "z" not in toolhead.get_status(eventtime).get("homed_axes", ""):
@@ -354,7 +509,42 @@ class K2ZAlign:
             lines.append("Suggested [k2_z_align] position_endstop: %.2f "
                          "(the lowest; too low is safe, too high is not)"
                          % (min(found.values()),))
+        if save:
+            lines.append(self._save_measured(found, remaining))
+        elif found:
+            lines.append("Run again with SAVE=1 to keep it (no need to edit"
+                         " printer-overrides.cfg)")
         gcmd.respond_info("KZ_ALIGN_MEASURE:\n" + "\n".join(lines))
+
+    def _save_measured(self, found, remaining):
+        """Keep min(found) - save_margin as position_endstop. Returns the
+        line to report."""
+        if remaining or not found:
+            return ("Not saved: every bottom switch must trigger (%s did "
+                    "not)" % (", ".join(self.endstop_pins[i]
+                                        for i in remaining),))
+        value = round(min(found.values()) - self.save_margin, 2)
+        if not self._saved_value_ok(value):
+            return ("Not saved: %.2f is more than %.1f mm from the config "
+                    "value %.2f. Check the nozzle is fitted and the bed is "
+                    "clear, then measure again; if it is right, set it in "
+                    "printer-overrides.cfg by hand"
+                    % (value, self.max_saved_change,
+                       self.config_position_endstop))
+        try:
+            self._write_saved(value, found)
+        except OSError as e:
+            logging.exception("k2_z_align: could not write %s",
+                              self.state_path)
+            return "Not saved: could not write %s (%s)" % (
+                self.state_path, e)
+        self.position_endstop = value
+        self.endstop_source = "saved"
+        self.saved_note = None
+        return ("Saved position_endstop %.2f (lowest switch less %.2f mm) "
+                "in %s: used from the next bottom reference on, also after "
+                "a restart. Measure again after changing the nozzle."
+                % (value, self.save_margin, self.state_path))
 
     def cmd_KZ_ALIGN_ABORT(self, gcmd):
         self._abort()
@@ -411,6 +601,7 @@ class K2ZAlign:
         # trap queue. From this point until a successful optical reference,
         # the previous logical Z coordinate must not be trusted.
         toolhead.get_kinematics().clear_homing_state("z")
+        self.frame_from_bottom = False
         for name, step_pin, dir_pin, pin in self.z_motors:
             self.gcode.run_script_from_command(
                 "SET_STEPPER_ENABLE STEPPER=%s ENABLE=1" % (name,))
@@ -444,6 +635,7 @@ class K2ZAlign:
             now = toolhead.get_position()
             now[2] = self.position_endstop
             toolhead.set_position(now, homing_axes="z")
+            self.frame_from_bottom = True
             # Each Z motor's step count at the switches: hark_plr maps it
             # into the nozzle-tap frame to find Z again after a power cut
             self.bottom_mcu = dict(

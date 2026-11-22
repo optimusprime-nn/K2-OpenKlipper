@@ -319,17 +319,23 @@ extruder_addr: 0x85, 0x81
     # --- bottom Z switches -------------------------------------------
     ("two bottom switches (PA15 left, PA8 right), zd_up 0. position_endstop\n"
      "is a deliberately LOW guess: too low only stops the bed short and the\n"
-     "tap fails safe; too high would drive the bed into the nozzle. Measure\n"
-     "it with KZ_ALIGN_MEASURE CONFIRM=1 and set it in printer-overrides.cfg",
+     "tap fails safe; too high would drive the bed into the nozzle. Printers\n"
+     "measured 349.85, 350.10 and 352.60 (issue #21, 0.6 nozzle), so until\n"
+     "KZ_ALIGN_MEASURE CONFIRM=1 SAVE=1 stores this printer's value the first\n"
+     "tap after the switches may search 4 mm below Z=0 (covers up to 353.5)",
      """allow_motion: true
 endstop_pin: PA15
 position_endstop: 263.12734375
 """, """allow_motion: true
 endstop_pin: PA15, PA8
-# First K2 Plus measured 349.85 / 350.10 (KZ_ALIGN_MEASURE); stock puts the
-# bottom at position_max - zmax_safe_pox_diff = 350. Kept a little low: too
-# low is safe, too high drives the bed into the nozzle.
+# Printers measured 349.85, 350.10 and 352.60 (KZ_ALIGN_MEASURE); stock puts
+# the bottom at position_max - zmax_safe_pox_diff = 350. Kept at the low end:
+# too low is safe, too high drives the bed into the nozzle.
 position_endstop: 349.5
+# Until KZ_ALIGN_MEASURE CONFIRM=1 SAVE=1 stores this printer's own value,
+# the first nozzle tap after the switches may search this far below Z=0
+# (strain gauge armed the whole way), so a bottom up to 353.5 still taps.
+unmeasured_tap_travel: 4.0
 """),
     ("bottom switch direction", "zd_up: 1\n", "zd_up: 0\n"),
     ("bottom switch timeout for the longer travel",

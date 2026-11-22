@@ -557,8 +557,17 @@ class HarkPLR:
         bottom_in_print = sum(offsets) / len(offsets)
         pos = self.toolhead.get_position()
         # The switches are at position_endstop now and at bottom_in_print
-        # in the print's frame
-        pos[2] = pos[2] - float(frame['position_endstop']) + bottom_in_print
+        # in the print's frame. Now means the value the bottom reference
+        # just used: KZ_ALIGN_MEASURE SAVE=1 may have changed it since the
+        # print saved its frame.
+        z_align = self.printer.lookup_object('k2_z_align', None)
+        endstop = getattr(z_align, 'position_endstop', None)
+        if endstop is None:
+            endstop = frame['position_endstop']
+        pos[2] = pos[2] - float(endstop) + bottom_in_print
+        if z_align is not None:
+            # Z is the print's frame now, not the bottom switches'
+            z_align.frame_from_bottom = False
         self.toolhead.set_position(pos, homing_axes="z")
 
     def _restore_mesh(self, state):
