@@ -59,12 +59,16 @@ class PrinterMotionQueuing:
         self.sg_high_time = BGFLUSH_SG_HIGH_TIME
         # "Drip" timing (for homing and probing moves)
         self.drip_start_times = []
+        self.drip_time = DRIP_TIME
         # Register handlers
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
     def set_buffer_headroom(self, headroom):
         # Generate steps this much further ahead (see toolhead.py)
         self.sg_low_time = BGFLUSH_SG_LOW_TIME + headroom
         self.sg_high_time = BGFLUSH_SG_HIGH_TIME + headroom
+    def set_drip_headroom(self, headroom):
+        # Send homing/probing steps this much further ahead (see toolhead.py)
+        self.drip_time = DRIP_TIME + headroom
     # C trapq tracking
     def allocate_trapq(self):
         ffi_main, ffi_lib = chelper.get_ffi()
@@ -282,7 +286,7 @@ class PrinterMotionQueuing:
                 break
             curtime = self.reactor.monotonic()
             est_print_time = self.mcu.estimated_print_time(curtime)
-            wait_time = flush_time - est_print_time - DRIP_TIME
+            wait_time = flush_time - est_print_time - self.drip_time
             if wait_time > 0. and self.can_pause:
                 # Pause before sending more steps
                 drip_completion.wait(curtime + wait_time)
