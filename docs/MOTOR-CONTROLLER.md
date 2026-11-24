@@ -89,14 +89,59 @@ Protection limits stored in the controllers (stock values from
 Jacob10383's map; all are in the configurable class, so they can be read with
 opcode 06):
 
-| Limit | ID | Stock |
-| --- | --- | --- |
-| continuous overcurrent | 0xb4 / 0xb5 | 4 A for 1 s (clear time 0xe3 = 0.5 s) |
-| peak overcurrent | 0xb3 | 999 A (off) |
-| overspeed | 0xb6 / 0xb7 | 314 rad/s for 0.1 s |
-| tracking error | 0xbb / 0xbc | 0.3 rad for 0.01 s (K2 F021: 0.1 s) |
-| minimum supply voltage | 0xbd | 20 V |
-| controller MCU temperature | 0xbe | 115 C |
+| Limit | ID | Stock X/Y | Stock extruder |
+| --- | --- | --- | --- |
+| continuous overcurrent | 0xb4 / 0xb5 | 4 A for 1 s | 2.5 A for 6 s |
+| continuous clear time | 0xe3 | 0.5 s | 0.5 s |
+| peak overcurrent | 0xb3 | 999 A (off) | 999 A (off) |
+| overspeed | 0xb6 / 0xb7 | 314 rad/s for 0.1 s | 105 rad/s |
+| tracking error | 0xbb / 0xbc | 0.3 rad for 0.01 s (K2 F021: 0.1 s) | |
+| minimum supply voltage | 0xbd | 20 V | |
+| controller MCU temperature | 0xbe | 115 C | |
+
+The extruder column is the extruder firmware build's defaults in
+Jacob10383's `motor_map.json` (motor R 0x29 = 2.0 there, 0.78 on X/Y); it has
+not been read back from a printer yet.
+
+### Extruder faults (issue #22)
+
+The pause from issue #22 was the reply `f7 81 0b 02 0c 08 00 00 00 00 00 00 00
+b3`: status 02 (error latch), error code 0x08 = bit 3, **software continuous
+overcurrent**, no warning. It is an error code, not a warning, and it stays
+latched until cleared (`00 0c 05`; the watch clears at print start and on
+resume). The controller sets it when its current stays above 0xb4 for 0xb5
+seconds: the extruder pushed hard for a long time. A full clog shows as a
+tracking error (bit 8) instead, because the motor can no longer follow.
+Jacob10383's firmware also pauses on any extruder error code, then clears it.
+Whether stock Creality firmware polls the extruder's status during a print is
+not known (its extruder bus is behind the nozzle MCU and was not captured).
+
+The watch still pauses on it, but the message now says what it means, and
+before pausing it reads the motor's `iq`, `id`, speed and controller
+temperature (00 08), and after it the protection limits (00 06 02 for 0xb4,
+0xb5, 0xe3, 0xb3, 0x29; read only). With the flow and nozzle temperature it
+kept for the last minute (host side, no bus traffic) this goes to the console
+as `Extruder fault details: ...`, to `klippy.log` (`extruder fault report`)
+and to `SAFETY_STATUS` / `printer.hark_safety.e_fault`.
+
+What to capture on a printer that pauses like this:
+
+1. The `Extruder fault details` line and `SAFETY_STATUS` output after the
+   pause, and `klippy.log` (search `hark_safety`).
+2. While printing the same file (before it trips), every few minutes:
+   `MOTOR_VALUES MOTOR=e` (iq is the motor current in A) and `MOTOR_TEMPS`.
+   Or log it: `MOTOR_LOG_START MOTOR=e INTERVAL=1` ... `MOTOR_LOG_STOP`
+   writes a CSV of position, speed and iq beside the PA logs.
+3. Whether the extruder actually stopped pushing (gaps or under-extrusion in
+   the layers just before the pause) or the print looked fine.
+4. The filament path: rear spool drag (a tight or tangled spool, the PTFE
+   from the rear holder), nozzle temperature and the flow of the section that
+   was printing (slicer volumetric speed).
+
+If iq sits near or above the continuous limit during normal printing, the
+extruder is working against drag or a hotend at its melt limit: lower the
+flow or the drag. If iq is low and the bit still latches, report it with the
+data above.
 
 `MOTOR_TEMPS` reads the controller MCU temperatures; `temp_poll_interval`
 polls them (off by default) and warns above `temp_warn` (100 C).

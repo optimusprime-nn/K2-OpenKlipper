@@ -186,7 +186,10 @@ def make_watch(replies, fail_count=2, names=('x', 'y')):
     w.e_addr = None
     w.motor_bad, w.motor_warned = {}, {}
     w.tripped = False
-    w.last = {'fans': {}, 'motors': {}, 'event': None}
+    w.last = {'fans': {}, 'motors': {}, 'event': None, 'e_fault': None}
+    w.e_history = hark_safety.collections.deque()
+    w.e_reported = False
+    w.extruder = w.motion_report = None
     return w
 
 
@@ -383,6 +386,200 @@ class BusXferTest(unittest.TestCase):
         # unconfirmed Y got one more try
         self.assertEqual(len(bus.ser.writes), 3)
 
+
+# Issue #22: the reply that paused a K2 PETG print from the rear spool after
+# ~30 min (status 02, error bit 3)
+ISSUE22 = bytes.fromhex("f7 81 0b 02 0c 08 00 00 00 00 00 00 00 b3")
+
+
+def float_reply(addr, func, value):
+    import struct
+    return reply(addr, 0x00, func, struct.pack('<f', value))
+
+
+class Issue22DecodeTest(unittest.TestCase):
+    def test_issue_frame_is_continuous_overcurrent(self):
+        f = proto.parse_frame(ISSUE22)
+        self.assertEqual((f['addr'], f['status'], f['func']),
+                         (0x81, 0x02, 0x0c))
+        d = proto.decode_protection(f)
+        self.assertEqual((d['error_code'], d['warning_code']), (0x08, 0))
+        self.assertEqual(d['errors'], ["software continuous overcurrent"])
+        self.assertTrue(d['has_error'])
+        self.assertTrue(d['faulted'])
+        self.assertFalse(d['warned'])
+
+    def test_overcurrent_hint_is_not_a_plain_jam(self):
+        d = proto.decode_protection(proto.parse_frame(ISSUE22))
+        hint = proto.extruder_fault_hint(d)
+        self.assertIn("current limit", hint)
+        self.assertNotIn("likely a clog or jam", hint)
+
+    def test_tracking_error_still_reads_as_clog(self):
+        d = proto.decode_protection(proto.parse_frame(FAULTED))
+        self.assertEqual(proto.extruder_fault_hint(d), "likely a clog or jam")
+        both = proto.decode_protection(proto.parse_frame(
+            reply(0x81, 0x02, 0x0c, [0x08, 0x01, 0, 0, 0, 0, 0, 0])))
+        self.assertEqual(proto.extruder_fault_hint(both),
+                         "likely a clog or jam")
+
+    def test_other_errors(self):
+        d = proto.decode_protection(proto.parse_frame(
+            reply(0x81, 0x02, 0x0c, [0x01, 0, 0, 0, 0, 0, 0, 0])))
+        self.assertEqual(proto.extruder_fault_hint(d),
+                         "an extruder controller fault")
+
+
+class FakeExtruder:
+    def __init__(self, temp=245., target=245., pa=0.07):
+        self.status = {'temperature': temp, 'target': target,
+                       'pressure_advance': pa, 'filament_diameter': 1.75}
+
+    def get_status(self, eventtime):
+        return dict(self.status)
+
+
+class FakeMotionReport:
+    def __init__(self):
+        self.vel = 0.
+
+    def get_status(self, eventtime):
+        return {'live_extruder_velocity': self.vel}
+
+
+class FakeEBus(FakeBus):
+    """FakeBus with the extruder and the read-only diagnostic reads."""
+    e_send = object()
+
+    def __init__(self, replies, values=None, limits=None):
+        FakeBus.__init__(self, replies)
+        self.values = values or {}
+        self.limits = limits or {}
+        self.reads = []
+
+    def read_value(self, name, index, addr=None):
+        self.reads.append(('value', name, index, addr))
+        return self.values.get(index)
+
+    def read_params(self, name, pids, addr=None):
+        self.reads.append(('params', name, tuple(pids), addr))
+        return dict((pid, self.limits.get(pid)) for pid in pids)
+
+
+def make_e_watch(e_reply, action='pause'):
+    w = make_watch({'x': HEALTHY, 'y': HEALTHY, 'e': e_reply})
+    w.bus = FakeEBus(w.bus.replies,
+                     values={proto.GET_IQ: 2.71, proto.GET_ID: 0.02,
+                             proto.GET_SPEED: 4.2, proto.GET_MCU_TEMP: 61.},
+                     limits={0xb4: 2.5, 0xb5: 6., 0xe3: .5, 0xb3: 999.,
+                             0x29: 2.})
+    w.e_action = action
+    w.extruder = FakeExtruder()
+    w.motion_report = FakeMotionReport()
+    return w
+
+
+class Issue22WatchTest(unittest.TestCase):
+    def test_overcurrent_still_pauses_with_the_right_reason(self):
+        w = make_e_watch(ISSUE22)
+        w._check_motors(0.)
+        w._check_motors(3.)
+        self.assertTrue(w.tripped)
+        self.assertEqual(w.gcode.scripts, ["PAUSE"])
+        self.assertIn("software continuous overcurrent", w.gcode.raw[-1])
+        self.assertIn("current limit", w.gcode.raw[-1])
+        self.assertNotIn("likely a clog or jam", w.gcode.raw[-1])
+
+    def test_tracking_error_on_e_pauses_as_clog(self):
+        w = make_e_watch(FAULTED)
+        w._check_motors(0.)
+        w._check_motors(3.)
+        self.assertTrue(w.tripped)
+        self.assertEqual(w.gcode.scripts, ["PAUSE"])
+        self.assertIn("likely a clog or jam", w.gcode.raw[-1])
+
+    def test_fault_report_has_motor_flow_and_limits(self):
+        w = make_e_watch(ISSUE22)
+        for t, vel in ((0., 4.), (3., 6.), (6., 5.)):
+            w.motion_report.vel = vel
+            w._note_extruder(t)
+        w._check_motors(6.)
+        w._check_motors(9.)
+        rep = w.last['e_fault']
+        self.assertEqual(rep['error_code'], 8)
+        self.assertEqual(rep['motor']['iq'], 2.71)
+        self.assertEqual(rep['limits']['continuous_A'], 2.5)
+        self.assertEqual(rep['limits']['continuous_s'], 6.)
+        self.assertAlmostEqual(rep['flow_max'], 6. * 2.405, places=1)
+        self.assertAlmostEqual(rep['flow_now'], 5. * 2.405, places=1)
+        self.assertEqual(rep['temp'], 245.)
+        self.assertEqual(rep['pa'], 0.07)
+        details = [m for m in w.gcode.info if "Extruder fault details" in m]
+        self.assertEqual(len(details), 1)
+        self.assertIn("iq 2.71 A", details[0])
+        self.assertIn("continuous 2.5 A for 6 s", details[0])
+        # The motor is read before the pause, the limits after it, and
+        # only with read requests
+        self.assertEqual([r[0] for r in w.bus.reads],
+                         ['value'] * 4 + ['params'])
+        self.assertEqual(w.bus.reads[-1][2],
+                         tuple(pid for pid, _ in proto.PROTECTION_LIMIT_IDS))
+
+    def test_history_keeps_a_minute(self):
+        w = make_e_watch(ISSUE22)
+        for t in range(0, 300, 3):
+            w._note_extruder(float(t))
+        self.assertLessEqual(w.e_history[-1]['time'] - w.e_history[0]['time'],
+                             hark_safety.E_HISTORY_TIME)
+
+    def test_log_action_reports_details_once(self):
+        w = make_e_watch(ISSUE22, action='log')
+        for t in range(6):
+            w._check_motors(float(t))
+        self.assertFalse(w.tripped)
+        self.assertEqual(w.gcode.scripts, [])
+        details = [m for m in w.gcode.info if "Extruder fault details" in m]
+        self.assertEqual(len(details), 1)
+        self.assertEqual(sum(1 for r in w.bus.reads if r[0] == 'params'), 1)
+
+    def test_no_diagnostic_reads_without_a_fault(self):
+        w = make_e_watch(HEALTHY)
+        for t in range(4):
+            w._check_motors(float(t))
+        self.assertEqual(w.bus.reads, [])
+        self.assertIsNone(w.last['e_fault'])
+
+    def test_safety_status_shows_last_fault(self):
+        w = make_e_watch(ISSUE22)
+        w._check_motors(0.)
+        w._check_motors(3.)
+        w.fan_action = 'pause'
+        out = []
+
+        class Cmd:
+            def get_int(self, *a, **k):
+                return 0
+
+            def respond_info(self, msg):
+                out.append(msg)
+        w.cmd_SAFETY_STATUS(Cmd())
+        self.assertIn("Last extruder fault", out[-1])
+        self.assertIn("f7 81 0b 02 0c 08", out[-1])
+
+
+class ReadParamsTest(unittest.TestCase):
+    def test_reads_then_ends_and_never_writes(self):
+        bus = make_bus([[float_reply(0x81, 0x06, 2.5)],
+                        [reply(0x81, 0x00, 0x06, [0xaf])],
+                        [reply(0x81, 0x00, 0x06, [0x01])]])
+        values = bus.read_params('x', [0xb4, 0xb5])
+        self.assertEqual(values[0xb4], 2.5)
+        self.assertIsNone(values[0xb5])
+        sent = [w[3:-1] for w in bus.ser.writes]
+        for payload in sent:
+            self.assertEqual(payload[:2], b'\x00\x06')
+            self.assertIn(payload[2], (0x02, 0x03))
+        self.assertEqual(sent[-1], b'\x00\x06\x03')
 
 if __name__ == "__main__":
     unittest.main()
