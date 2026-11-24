@@ -1,0 +1,33 @@
+# Unit tests on the organisation's self-hosted Linux runners. Some tests
+# need cffi and a native Klipper chelper build, which the Windows dev PC
+# lacks, so they only run here.
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    runs-on: [self-hosted, Linux, X64, big]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python environment
+        run: |
+          python3 --version
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet cffi numpy pillow
+      - name: Rebuild the Klipper C helper for this machine
+        # The committed c_helper.so is built for the printer (ARM)
+        run: |
+          rm -f klippy/chelper/c_helper.so
+          .venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi(); print('chelper ok')"
+      - name: Unit tests
+        run: .venv/bin/python -m unittest discover -s tests -t . -v 2>&1 | tail -n 300
+        shell: bash -o pipefail {0}
