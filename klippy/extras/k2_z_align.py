@@ -62,8 +62,11 @@ class K2ZAlign:
         # more than max_saved_change from the config value
         self.save_margin = config.getfloat(
             "save_margin", 0.1, minval=0.0, maxval=1.0)
+        # 10 mm: one K2 needed 270 against the F021 default 263.13 (#21).
+        # The value is a measurement (Z homed by the nozzle tap, every
+        # switch triggered), so this only catches a wild reading
         self.max_saved_change = config.getfloat(
-            "max_saved_change", 5.0, above=0.0, maxval=20.0)
+            "max_saved_change", 10.0, above=0.0, maxval=20.0)
         # How far below Z=0 the first tap after a bottom reference may
         # search while position_endstop has not been measured (0 = only
         # [prtouch_mainline] probe_minimum_z, as on the K2)

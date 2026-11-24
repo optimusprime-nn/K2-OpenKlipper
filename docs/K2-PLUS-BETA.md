@@ -142,7 +142,7 @@ the output. `KZ_ALIGN_STATUS` shows the value in use and where it came from
 
 A saved value replaces any `position_endstop` you set in
 printer-overrides.cfg earlier; you can delete that line. It is refused if
-it is more than 5 mm from the config value (check the nozzle and bed, and
+it is more than 10 mm from the config value (check the nozzle and bed, and
 set it by hand if it really is right).
 
 Measure again after changing the nozzle: nozzle length moves the bottom.

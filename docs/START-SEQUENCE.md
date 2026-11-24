@@ -12,6 +12,12 @@ measurement and no ooze on the measured bed.
    (Z = 263.13 on F021) and backs off 10 mm. This gives an absolute Z
    reference on every print, whatever happened to Z before. It takes about
    50 s.
+   The switch height differs between printers (one K2 needed 270). If a
+   print start stops at step 6 with `No trigger on probe after full
+   movement`, run `G28` (outside a print the K2 finds Z by the nozzle tap
+   alone), then `KZ_ALIGN_MEASURE CONFIRM=1 SAVE=1`: it measures the
+   switch height and keeps it for every later print. `KZ_ALIGN_STATUS`
+   shows the value in use.
    **Warm start:** if the previous print finished or was cancelled
    normally and the motors stayed on, the printer is still homed, so steps 2
    and 3 are skipped (like stock). Z is still measured by the tap in step 6.
