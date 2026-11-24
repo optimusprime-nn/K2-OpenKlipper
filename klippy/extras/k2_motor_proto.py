@@ -245,6 +245,42 @@ def describe_protection(detail):
     return "; ".join(parts) or "ok"
 
 
+# Error bits by what they say about an extruder (issue #22). Overcurrent
+# (2-4) means the controller pushed past its current limit; tracking and
+# position bits (5-8) mean it could not follow the steps. Both can come
+# from a clog, but overcurrent alone also comes from drag on the filament
+# path or more flow than the hotend melts.
+OVERCURRENT_BITS = frozenset((2, 3, 4))
+FOLLOWING_BITS = frozenset((5, 6, 7, 8))
+
+
+def error_bits(error_code):
+    code = int(error_code or 0)
+    return frozenset(b for b in range(32) if code >> b & 1)
+
+
+def extruder_fault_hint(detail):
+    """What an extruder controller error code most likely means, for the
+    safety watch's pause message."""
+    bits = error_bits(detail.get('error_code'))
+    if bits & FOLLOWING_BITS:
+        return "likely a clog or jam"
+    if bits and bits <= OVERCURRENT_BITS:
+        return ("the motor pushed past its current limit for too long: a "
+                "partial clog, drag on the filament path or more flow than "
+                "the hotend melts")
+    return "an extruder controller fault"
+
+
+# Protection limits read back for a fault report (opcode 06 02, read only;
+# float32). Stock values differ by motor build (Jacob10383's motor_map.json):
+# the X/Y build has 4 A for 1 s, the extruder build 2.5 A for 6 s. Motor R
+# (0x29) tells the builds apart: 0.78 X/Y, 2.0 extruder.
+PROTECTION_LIMIT_IDS = (
+    (0xb4, 'continuous_A'), (0xb5, 'continuous_s'),
+    (0xe3, 'continuous_clear_s'), (0xb3, 'peak_A'), (0x29, 'motor_R'))
+
+
 def decode_float(payload):
     payload = bytes(payload)
     if len(payload) != 4:

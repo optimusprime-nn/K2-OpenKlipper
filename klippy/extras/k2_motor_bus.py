@@ -793,14 +793,29 @@ class K2MotorBus:
             results.append((name, addr, ok, frame, resp))
         return results
 
-    def read_value(self, name, index):
+    def read_value(self, name, index, addr=None):
         """One 'get value' (00 08 <index>) float from motor x, y or e, or
         None without a valid 4-byte reply."""
         frame, raw = self.motor_request(
-            name, (0x00, proto.FUNC_GET, index), timeout=0.1)
+            name, (0x00, proto.FUNC_GET, index), addr, timeout=0.1)
         if frame is None or len(frame['payload']) != 4:
             return None
         return proto.decode_float(frame['payload'])
+
+    def read_params(self, name, pids, addr=None):
+        """Read system parameters (00 06 02 <id>, float32) from motor x, y
+        or e and end the read (00 06 03), as the wake does. Read only:
+        never a write, never opcode 07. Returns {id: value or None}."""
+        values = {}
+        for pid in pids:
+            frame, raw = self.motor_request(
+                name, (0x00, proto.FUNC_SYS_PARAM, 0x02, pid), addr,
+                timeout=0.1)
+            values[pid] = None
+            if frame is not None and len(frame['payload']) == 4:
+                values[pid] = proto.decode_float(frame['payload'])
+        self.motor_request(name, END_PARAM_READ, addr, timeout=0.1)
+        return values
 
     def read_temp(self, name):
         temp = self.read_value(name, proto.GET_MCU_TEMP)

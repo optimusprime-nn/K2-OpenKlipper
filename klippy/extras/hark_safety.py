@@ -13,7 +13,12 @@
 #   - polls the X/Y motor controllers' status (00 0c 0b, as stock does) and
 #     cancels the print on a fault (stall, tracking error, overcurrent ...),
 #   - polls the extruder controller's status and pauses on a fault: an
-#     extruder that cannot follow (clog, jam) trips its tracking protection.
+#     extruder that cannot follow (clog, jam) trips its tracking protection,
+#     one that pushes past its current limit for too long trips its
+#     continuous overcurrent protection (issue #22). The pause message says
+#     which, with the motor's current, speed and temperature at the fault,
+#     the flow and nozzle temperature over the last minute and the
+#     controller's protection limits (also in SAFETY_STATUS and the log).
 # Only an error code in the reply trips an action, named in the message.
 # Warning codes (supply voltage low, controller MCU hot, comms) are reported
 # once and the print carries on. A missing or invalid reply never trips.
@@ -29,7 +34,9 @@
 # Copyright (C) 2026  Hark Tech
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import collections
 import logging
+import math
 
 from . import k2_motor_proto as proto
 
@@ -37,6 +44,9 @@ ACTIONS = {'cancel': 'cancel', 'pause': 'pause', 'log': 'log'}
 # No homing move lasts this long: a count still up after it is a home that
 # failed (Klipper only sends home_rails_end on success)
 HOMING_STALE = 120.
+# Extruder flow and nozzle temperature kept for a fault report (one sample
+# per poll, host side only: no bus traffic)
+E_HISTORY_TIME = 60.
 
 
 class HarkSafety:
@@ -80,7 +90,11 @@ class HarkSafety:
         self.fan_zero_since = {}
         self.motor_bad = {}
         self.motor_warned = {}
-        self.last = {'fans': {}, 'motors': {}, 'event': None}
+        self.last = {'fans': {}, 'motors': {}, 'event': None,
+                     'e_fault': None}
+        self.e_history = collections.deque()
+        self.e_reported = False
+        self.extruder = self.motion_report = None
         self.gcode.register_command('SAFETY_STATUS', self.cmd_SAFETY_STATUS,
                                     desc="Report the print safety watch")
         self.gcode.register_command('SAFETY_TEST', self.cmd_SAFETY_TEST,
@@ -92,6 +106,8 @@ class HarkSafety:
         self.part_fan = self.printer.lookup_object('fan', None)
         self.hotend_fan = self.printer.lookup_object('heater_fan hotend_fan',
                                                      None)
+        self.extruder = self.printer.lookup_object('extruder', None)
+        self.motion_report = self.printer.lookup_object('motion_report', None)
         self.reactor.register_timer(self._poll, self.reactor.NOW)
 
     # --- polling -------------------------------------------------------
@@ -131,7 +147,11 @@ class HarkSafety:
                 self.tripped = False
                 self.fan_on_since.clear(); self.fan_zero_since.clear()
                 self.motor_bad.clear(); self.motor_warned.clear()
+                self.e_history.clear()
+                self.e_reported = False
             self.was_printing = printing
+            if printing:
+                self._note_extruder(eventtime)
             quiet = self.bus is not None and self.bus_quiet(eventtime)
             if printing and self.need_clear and not quiet:
                 self.need_clear = False
@@ -218,10 +238,7 @@ class HarkSafety:
                 if bad >= self.motor_fail_count:
                     what = ", ".join(detail['errors'])
                     if name == 'e':
-                        self._trip(self.e_action,
-                                   "the extruder motor reports %s (%s): "
-                                   "likely a clog or jam"
-                                   % (what, detail['raw']))
+                        self._trip_extruder(eventtime, detail, what)
                     else:
                         self._trip(self.xy_action,
                                    "the %s motor reports %s (%s): stall, "
@@ -231,6 +248,142 @@ class HarkSafety:
                 continue
             self.motor_bad[name] = 0
             self._warn_motor(name, detail)
+
+    # --- extruder fault report (issue #22) -----------------------------
+    def _extruder_sample(self, eventtime):
+        sample = {'time': eventtime}
+        try:
+            status = {}
+            if self.extruder is not None:
+                status = self.extruder.get_status(eventtime)
+                for key, out in (('temperature', 'temp'),
+                                 ('target', 'target'),
+                                 ('pressure_advance', 'pa')):
+                    if status.get(key) is not None:
+                        sample[out] = float(status[key])
+            if self.motion_report is not None:
+                vel = self.motion_report.get_status(eventtime).get(
+                    'live_extruder_velocity')
+                if vel is not None:
+                    dia = float(status.get('filament_diameter', 1.75))
+                    sample['flow'] = float(vel) * math.pi * dia * dia / 4.
+        except Exception:
+            logging.exception("hark_safety: extruder sample failed")
+        return sample
+
+    def _note_extruder(self, eventtime):
+        self.e_history.append(self._extruder_sample(eventtime))
+        while (self.e_history
+               and self.e_history[0]['time'] < eventtime - E_HISTORY_TIME):
+            self.e_history.popleft()
+
+    def _extruder_summary(self):
+        """Flow (mm^3/s) and nozzle temperature over the last minute."""
+        hist = list(self.e_history)
+        out = {}
+        flows = [s['flow'] for s in hist if 'flow' in s]
+        if flows:
+            out.update(flow_now=round(flows[-1], 2),
+                       flow_max=round(max(flows), 2),
+                       flow_mean=round(sum(flows) / len(flows), 2),
+                       samples=len(flows))
+        temps = [s['temp'] for s in hist if 'temp' in s]
+        if temps:
+            out.update(temp=round(temps[-1], 1), temp_min=round(min(temps), 1))
+        for key in ('target', 'pa'):
+            vals = [s[key] for s in hist if key in s]
+            if vals:
+                out[key] = round(vals[-1], 4)
+        return out
+
+    def _read_e_values(self):
+        """Current, speed and controller temperature as the fault is
+        seen (read only, 00 08 <n>)."""
+        out = {}
+        read = getattr(self.bus, 'read_value', None)
+        if read is None:
+            return out
+        for index in (proto.GET_IQ, proto.GET_ID, proto.GET_SPEED,
+                      proto.GET_MCU_TEMP):
+            try:
+                value = read('e', index, addr=self._addr('e'))
+            except Exception as e:
+                logging.info("hark_safety: extruder read %02x failed: %s",
+                             index, e)
+                value = None
+            out[proto.GET_LABELS[index]] = (
+                None if value is None else round(value, 3))
+        return out
+
+    def _read_e_limits(self):
+        """The controller's overcurrent limits (read only, 00 06 02)."""
+        read = getattr(self.bus, 'read_params', None)
+        if read is None:
+            return {}
+        try:
+            values = read('e', [pid for pid, _ in proto.PROTECTION_LIMIT_IDS],
+                          addr=self._addr('e'))
+        except Exception as e:
+            logging.info("hark_safety: extruder limit read failed: %s", e)
+            return {}
+        return dict((label, None if values.get(pid) is None
+                     else round(values[pid], 4))
+                    for pid, label in proto.PROTECTION_LIMIT_IDS)
+
+    @staticmethod
+    def describe_e_fault(report):
+        def num(value, fmt):
+            return '?' if value is None else fmt % (value,)
+        parts = []
+        motor = report.get('motor') or {}
+        if motor:
+            parts.append("motor iq %s A, id %s A, speed %s rad/s, "
+                         "controller %s C"
+                         % (num(motor.get('iq'), '%.2f'),
+                            num(motor.get('id'), '%.2f'),
+                            num(motor.get('speed'), '%.2f'),
+                            num(motor.get('mcu_temp'), '%.1f')))
+        if 'flow_now' in report:
+            parts.append("flow %.1f mm^3/s (last 60 s: max %.1f, mean %.1f)"
+                         % (report['flow_now'], report['flow_max'],
+                            report['flow_mean']))
+        if 'temp' in report:
+            parts.append("nozzle %.1f/%s C (lowest %.1f)"
+                         % (report['temp'], num(report.get('target'), '%.0f'),
+                            report['temp_min']))
+        if 'pa' in report:
+            parts.append("PA %.4f" % (report['pa'],))
+        limits = report.get('limits') or {}
+        if limits:
+            parts.append("limits: continuous %s A for %s s (clear %s s), "
+                         "peak %s A, motor R %s"
+                         % tuple(num(limits.get(k), '%g') for k in (
+                             'continuous_A', 'continuous_s',
+                             'continuous_clear_s', 'peak_A', 'motor_R')))
+        return "; ".join(parts) or "no details"
+
+    def _trip_extruder(self, eventtime, detail, what):
+        hint = proto.extruder_fault_hint(detail)
+        why = "the extruder motor reports %s (%s): %s" % (
+            what, detail['raw'], hint)
+        if self.e_reported:
+            # e_action log trips every poll: report the details once
+            self._trip(self.e_action, why)
+            return
+        self.e_reported = True
+        report = {'raw': detail['raw'], 'error_code': detail['error_code'],
+                  'warning_code': detail['warning_code'],
+                  'errors': list(detail['errors']),
+                  'warnings': list(detail['warnings']), 'hint': hint}
+        report.update(self._extruder_summary())
+        # Read the motor before the pause stops it, the limits after
+        report['motor'] = self._read_e_values()
+        self.last['e_fault'] = report
+        self._trip(self.e_action, why)
+        report['limits'] = self._read_e_limits()
+        line = self.describe_e_fault(report)
+        logging.warning("hark_safety: extruder fault report %s", report)
+        self.gcode.respond_info("Extruder fault details: %s" % (line,))
 
     def _warn_motor(self, name, detail):
         # Warnings (low supply voltage, controller MCU hot, comms) do not
@@ -315,11 +468,15 @@ class HarkSafety:
             "%s %s" % (name.upper(), "no reply" if m is None
                        else "%s [%s]" % (m['summary'], m['raw']))
             for name, m in sorted(self.last['motors'].items())) or "not read"
-        gcmd.respond_info(
-            "Safety watch: fans %s, motors %s, actions fan=%s xy=%s e=%s, "
-            "last event %s" % (self.last['fans'], motors,
-                               self.fan_action, self.xy_action, self.e_action,
-                               self.last['event']))
+        msg = ("Safety watch: fans %s, motors %s, actions fan=%s xy=%s e=%s, "
+               "last event %s" % (self.last['fans'], motors,
+                                  self.fan_action, self.xy_action,
+                                  self.e_action, self.last['event']))
+        if self.last.get('e_fault'):
+            msg += "\nLast extruder fault: %s [%s]" % (
+                self.describe_e_fault(self.last['e_fault']),
+                self.last['e_fault']['raw'])
+        gcmd.respond_info(msg)
 
     def cmd_SAFETY_TEST(self, gcmd):
         kind = gcmd.get('TYPE').upper()
@@ -331,7 +488,8 @@ class HarkSafety:
 
     def get_status(self, eventtime):
         return {'tripped': self.tripped, 'last_event': self.last['event'],
-                'fans': self.last['fans'], 'motors': self.last['motors']}
+                'fans': self.last['fans'], 'motors': self.last['motors'],
+                'e_fault': self.last.get('e_fault')}
 
 
 def load_config(config):
