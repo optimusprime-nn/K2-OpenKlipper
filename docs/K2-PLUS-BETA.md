@@ -47,7 +47,9 @@ The config is generated from the K2 one by `tools/k2plus/make_k2plus_cfg.py`
   leaves the motor firmware default, which is what the K2 uses).
 - Untested on the Plus: a CFS (the tested printer has none), the camera, the
   flow and retraction test prints (they print centred at X130 Y130, which is
-  still on the bed).
+  still on the bed). With a CFS, do steps 1 to 6 below and then
+  [K2-PLUS-CFS-FIRST-RUN.md](K2-PLUS-CFS-FIRST-RUN.md), which checks every
+  CFS move on the Plus one at a time before the first CFS print.
 
 Supported layout: the installer checks `get_sn_mac.sh board` and
 `structure_version` and only installs on boards CR0CN240110C10, CR0CN240319C13

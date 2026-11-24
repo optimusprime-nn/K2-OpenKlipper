@@ -76,12 +76,14 @@ class Cmd:
         return RuntimeError(msg)
 
 
-def make_cfs(stop_x, noisy=(), stall_motor='x'):
+def make_cfs(stop_x, noisy=(), stall_motor='x', x_min=None):
     cfs = cfs_mod.K2CFS.__new__(cfs_mod.K2CFS)
     cfs.gcode = FakeGcode(cfs)
     bus = cfs.bus = FakeBus(cfs, stop_x, noisy, stall_motor)
-    objects = {'k2_motor_bus': bus,
-               'toolhead': Obj({'max_accel': 12000.})}
+    toolhead = {'max_accel': 12000.}
+    if x_min is not None:
+        toolhead['axis_minimum'] = [x_min, -6.2, -10., 0.]
+    objects = {'k2_motor_bus': bus, 'toolhead': Obj(toolhead)}
 
     class P:
         def lookup_object(self, name, default=None):
@@ -141,6 +143,25 @@ class CutterStallTest(unittest.TestCase):
         self.assertIsNone(cfs.status['cutter_cal_x'])
         self.assertTrue(cfs.gcode.scripts[-1].endswith(
             'RESTORE_GCODE_STATE NAME=K2_CUT_STALL'))
+
+    def test_rams_stay_inside_the_k2_plus_x_travel(self):
+        # The K2 Plus X travel starts at -10 (K2: -12): the default search
+        # stops there instead of failing on a move out of range at -10.1
+        cfs, bus = make_cfs(-20., x_min=-10.)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_cal(cfs)
+        self.assertIn('-10.00', str(ctx.exception))
+        rams = [float(line.split()[1][1:])
+                for s in cfs.gcode.scripts for line in s.splitlines()
+                if line.startswith("G1 X") and "F30000" in line]
+        self.assertAlmostEqual(min(rams), -10.)
+
+    def test_a_stop_outside_the_x_travel_is_refused(self):
+        cfs, bus = make_cfs(-8.0, x_min=-10.)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_cal(cfs, STOP='-10.5')
+        self.assertIn('outside the X travel', str(ctx.exception))
+        self.assertEqual(cfs.gcode.scripts, [])
 
     def test_needs_confirm_and_no_filament(self):
         cfs, bus = make_cfs(-8.0)

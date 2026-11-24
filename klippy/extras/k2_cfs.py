@@ -1734,6 +1734,7 @@ class K2CFS:
         start = gcmd.get_float('START', self.cutter_cal_start_x, maxval=0.)
         stop = gcmd.get_float('STOP', self.cutter_cal_min_x, minval=-11.,
                               below=start)
+        self._check_cal_stop(gcmd, stop)
         step = gcmd.get_float('STEP', .05, minval=.01, maxval=.5)
         push_rate = gcmd.get_float('SPEED', 5., above=0., maxval=20.) * 60.
         travel_rate = self.cutter_speed * 60.
@@ -1808,7 +1809,11 @@ class K2CFS:
         if bus is None:
             raise gcmd.error("No k2_motor_bus: the X/Y motors cannot be read")
         start = gcmd.get_float('START', self.cutter_cal_start_x, maxval=0.)
-        stop = gcmd.get_float('STOP', -11., minval=-11., below=start)
+        # Down to -11 on the K2 (X travel from -12); the K2 Plus X travel
+        # starts at -10, so stop there rather than at a move out of range
+        stop = gcmd.get_float('STOP', max(-11., self._x_travel_min()),
+                              minval=-11., below=start)
+        self._check_cal_stop(gcmd, stop)
         step = gcmd.get_float('STEP', .1, minval=.05, maxval=.5)
         toolhead = self.printer.lookup_object('toolhead')
         prior_accel = toolhead.get_status(0.).get('max_accel')
@@ -1889,6 +1894,22 @@ class K2CFS:
             "[k2_cfs]\ncutter_cut_x: %.2f"
             % (hits[-2], hits[-1], result, self.cutter_stall_offset,
                self.cutter_cut_x, result))
+
+    def _x_travel_min(self):
+        # The X travel's low end (stepper_x position_min): -12 on the K2,
+        # -10 on the K2 Plus
+        toolhead = self.printer.lookup_object('toolhead', None)
+        try:
+            return float(toolhead.get_status(0.)['axis_minimum'][0])
+        except Exception:
+            return -11.
+
+    def _check_cal_stop(self, gcmd, stop):
+        x_min = self._x_travel_min()
+        if stop < x_min - 1e-6:
+            raise gcmd.error(
+                "STOP=%.2f is outside the X travel (position_min %.2f)"
+                % (stop, x_min))
 
     def cmd_CFS_CUTTER_SENSOR(self, gcmd):
         state = ("unknown" if self.cutter_switch_state is None else

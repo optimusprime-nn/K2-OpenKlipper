@@ -520,6 +520,9 @@ CHANGES_ALL = [
      "{indent}    FORCE_MOVE STEPPER=stepper_z DISTANCE=5 VELOCITY=10\n"
      "{indent}    FORCE_MOVE STEPPER=stepper_z1 DISTANCE=5 VELOCITY=10\n"
      "{indent}{% endif %}", 2),
+    ("purge line (_HARK_LINE_PURGE): keep its far end 5 mm inside the mesh "
+     "area like the K2 (255 - 5), 340 on the 350 bed, not the K2's 250",
+     "250 - total]|min", "340 - total]|min", 2),
 ]
 
 
@@ -668,7 +671,7 @@ def main():
         sys.exit("make_k2plus_cfg: %s has CR line endings" % SRC)
     out = apply(text)
     check = ('position_max: 262', 'gear_ratio', 'tmc2208 stepper_z',
-             'Y261', 'X205', 'Y265.5', 'X130 Y125')
+             'Y261', 'X205', 'Y265.5', 'X130 Y125', '250 - total')
     # X205 is a K2 park position, but also the end of the K2 Plus scrub
     start = out.index('[gcode_macro _NOZZLE_CLEAR_SCRUB]')
     end = out.index('[gcode_macro _HEAT_SOAK]', start)
