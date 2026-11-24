@@ -25,7 +25,7 @@ jobs:
         run: |
           python3 --version
           python3 -m venv .venv
-          .venv/bin/pip install --quiet cffi numpy pillow
+          .venv/bin/pip install --quiet cffi numpy pillow jinja2
       - name: Rebuild the Klipper C helper for this machine
         # The committed c_helper.so is built for the printer (ARM)
         run: |
