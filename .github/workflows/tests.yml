@@ -32,5 +32,5 @@ jobs:
           rm -f klippy/chelper/c_helper.so
           .venv/bin/python -c "import sys; sys.path.insert(0, 'klippy'); import chelper; chelper.get_ffi(); print('chelper ok')"
       - name: Unit tests
-        run: .venv/bin/python -m unittest discover -s tests -t . -v 2>&1 | tail -n 300
+        run: .venv/bin/python -m unittest discover -s tests -v 2>&1 | tail -n 300
         shell: bash -o pipefail {0}
